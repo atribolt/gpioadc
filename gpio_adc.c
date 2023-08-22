@@ -65,10 +65,12 @@ static void (*exit_function)(void) = NULL;
 int gpio_adc_init(void)
 {
 	if (gpioadc_mode == GPIOADC_MODE_IRQ) {
+    gpio_adc_info("mode IRQ enabled");
 		init_function = gpioadc_on_irq_init;
 		exit_function = gpioadc_on_irq_exit;
 	}
 	else if (gpioadc_mode == GPIOADC_MODE_KTHREAD) {
+    gpio_adc_info("mode LOOP enabled");
 		init_function = gpioadc_on_kthread_init;
 		exit_function = gpioadc_on_kthread_exit;
 	}
@@ -93,7 +95,7 @@ module_init(gpio_adc_init);
 module_exit(gpio_adc_exit);
 
 //------------------------------------------------------------------
-int gpioadc_init()
+static int gpioadc_init(void)
 {
 	struct gpio_chip* chip = gpiochip_find(NULL, check_gpio);
 	if (!chip) {
@@ -137,6 +139,11 @@ int gpioadc_init()
 static irqreturn_t gpio_irq_handler(int irq, void* data)
 {
 	(void)(data);
+
+	if (irq != GPIO_CLK_IRQ)
+	{
+		return IRQ_NONE;
+	}
 
 	static const unsigned long VALUE_MASK = ~(1ul << gpio_clk_id | 1ul << gpio_owf_id);
 
@@ -202,7 +209,7 @@ static void gpioadc_on_irq_exit(void)
 static int stop_flag = 0;
 static struct completion loop_exited;
 static struct task_struct *gpioadc_kthread = NULL;
-
+static int last_err = 0;
 
 static int gpioadc_loop(void* data)
 {
@@ -212,6 +219,7 @@ static int gpioadc_loop(void* data)
 
 	int old_clk_val = 0;
 
+  gpio_adc_info("loop started");
 	while (!stop_flag) {
 		unsigned long value = 0;
 
@@ -219,24 +227,35 @@ static int gpioadc_loop(void* data)
 
 		int clk = value & CLK_MASK;
 
-		if (!clk && old_clk_val)
+		if (!clk && old_clk_val) // CLK: 1 -> 0
 		{
 			value = value & VALUE_MASK;
 
 			if (GPIO_OLD_VALUE != -1ul) {
 				int is_valid = ((GPIO_OLD_VALUE == MAX_ADC_NUMBER) && (value == 0)) || ((GPIO_OLD_VALUE + 1) == value);
 				if (!is_valid) {
-					gpio_adc_warn("trottling: %lu -> %lu", GPIO_OLD_VALUE, value);
+					if (!last_err) {
+						gpio_adc_warn("trottling: %lu -> %lu", GPIO_OLD_VALUE, value);
+						last_err = 1;
+					}
+				}
+				else {
+					last_err = 0;
 				}
 			}
-		}
-		else if (clk && !old_clk_val)
-		{
-			old_clk_val = clk;
-		}
+			else {
+				gpio_adc_info("value start: %lu", value);
+			}
 
-		GPIO_OLD_VALUE = value;
+			GPIO_OLD_VALUE = value;
+		}
+		else if (clk && !old_clk_val) // CLK: 1 -> 0
+		{
+			old_clk_val = 1;
+		}
 	}
+
+  gpio_adc_info("loop stopped");
 
 	complete_all(&loop_exited);
 	return 0;
@@ -250,17 +269,25 @@ static int gpioadc_on_kthread_init(void)
 		return ec;
 	}
 
-	gpioadc_kthread = kthread_create(gpioadc_loop, NULL, "gpioadc");
+	gpioadc_kthread = kthread_run(gpioadc_loop, NULL, "gpioadc");
 	if (!gpioadc_kthread) {
 		return -EBADHANDLE;
 	}
 
+  gpio_adc_info("module inited");
 	return INIT_OK;
 }
 
 static void gpioadc_on_kthread_exit(void)
 {
 	stop_flag = 1;
+
+	gpio_adc_info("wait for thread stop");
 	wait_for_completion(&loop_exited);
+
+	gpio_adc_info("module thread stopped");
+
+	int code = kthread_stop(gpioadc_kthread);
+	gpio_adc_info("module thread code: %d", code);
 }
 //------------------------------------------------------------------
